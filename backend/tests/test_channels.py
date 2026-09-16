@@ -38,6 +38,13 @@ def test_known_channel_command_detection_only_matches_control_commands():
     assert not is_known_channel_command(" /new")
 
 
+def test_thread_in_known_commands():
+    from app.channels.commands import is_known_channel_command
+
+    for text in ("/thread", "/thread 2", "/thread next", "/thread prev"):
+        assert is_known_channel_command(text)
+
+
 def test_strip_leading_mentions_only_drops_flush_leading_mentions():
     from app.channels.commands import is_known_channel_command, strip_leading_mentions
 
@@ -10684,6 +10691,326 @@ class TestHandleGoalCommand:
             manager = self._make_manager(monkeypatch, thread_id="t-1")
             reply = await manager._handle_goal_command(self._msg("/goal do X"), "do X")
             assert reply == "Failed to set goal."
+
+        _run(go())
+
+
+class TestHandleThreadCommand:
+    """Covers the IM-channel ``/thread`` picker: list, select, page, switch."""
+
+    _UNSET = object()
+
+    @staticmethod
+    def _row(thread_id: str, title: str | None = None) -> dict:
+        return {"thread_id": thread_id, "values": {"title": title} if title else {}}
+
+    @staticmethod
+    def _msg(text: str) -> InboundMessage:
+        return InboundMessage(channel_name="test", chat_id="chat1", user_id="user1", text=text, msg_type=InboundMessageType.COMMAND)
+
+    @staticmethod
+    def _make_manager(monkeypatch, *, current_thread_id=_UNSET):
+        from app.channels.manager import ChannelManager
+
+        bus = MessageBus()
+        store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+        manager = ChannelManager(bus=bus, store=store, gateway_url="http://gateway:8001")
+        if current_thread_id is not TestHandleThreadCommand._UNSET:
+
+            async def _lookup(msg):
+                return current_thread_id
+
+            monkeypatch.setattr(manager, "_lookup_thread_id", _lookup)
+        return manager
+
+    @staticmethod
+    def _install_fake_fetch(monkeypatch, manager, page_rows: dict[int, list[dict]]):
+        """Replace ``_fetch_thread_page`` with a fake serving ``page_rows`` by page.
+
+        ``has_more`` mirrors the real overflow probe: True when the following
+        page has content. Returns the list of requested page numbers so tests
+        can assert which offsets were fetched.
+        """
+        requested_pages: list[int] = []
+
+        async def fake(msg, *, page):
+            requested_pages.append(page)
+            return list(page_rows.get(page, [])), bool(page_rows.get(page + 1, []))
+
+        monkeypatch.setattr(manager, "_fetch_thread_page", fake)
+        return requested_pages
+
+    def test_thread_lists_recent_threads(self, monkeypatch):
+        async def go():
+            manager = self._make_manager(monkeypatch, current_thread_id="t2")
+            self._install_fake_fetch(
+                monkeypatch,
+                manager,
+                {1: [self._row("t1", "First"), self._row("t2", "Second"), self._row("t3"), self._row("t4", "Fourth")]},
+            )
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            manager.bus.subscribe_outbound(capture_outbound)
+            await manager.start()
+            await manager.bus.publish_inbound(self._msg("/thread"))
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            text = outbound_received[0].text
+            assert "1. First" in text
+            assert "2. Second (current)" in text
+            assert "3. t3" in text  # untitled -> short id
+            assert "4. Fourth" in text
+            assert "Reply /thread <number> to switch." in text
+            assert "/thread next for more." in text
+            assert "/thread prev" not in text  # page 1 footer omits prev
+
+        _run(go())
+
+    def test_thread_select_switches_mapping(self, monkeypatch):
+        async def go():
+            manager = self._make_manager(monkeypatch)  # real store-backed lookup
+            store = manager.store
+            self._install_fake_fetch(monkeypatch, manager, {1: [self._row("t1", "First"), self._row("t2", "Second"), self._row("t3", "Third")]})
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            manager.bus.subscribe_outbound(capture_outbound)
+            await manager.start()
+            await manager.bus.publish_inbound(self._msg("/thread 2"))
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            # Store re-pointed to the 2nd row's thread id.
+            assert store.get_thread_id("test", "chat1") == "t2"
+            # A following lookup resolves the switched thread.
+            assert await manager._lookup_thread_id(self._msg("hi")) == "t2"
+            # Confirmation names the title and short id.
+            assert outbound_received[0].text == "Now chatting in: Second (t2)."
+            # Cursor reset to page 1 after a successful switch.
+            assert manager._thread_picker_page[("test", "chat1", None)] == 1
+
+        _run(go())
+
+    def test_thread_next_prev_pagination(self, monkeypatch):
+        async def go():
+            manager = self._make_manager(monkeypatch)
+            page_rows = {1: [self._row(f"t{i}") for i in range(1, 11)], 2: [self._row(f"t{i}") for i in range(11, 16)]}
+            requested_pages = self._install_fake_fetch(monkeypatch, manager, page_rows)
+            key = ("test", "chat1", None)
+
+            # /thread renders page 1.
+            reply = await manager._handle_thread_command(self._msg("/thread"), "")
+            assert "1. t1" in reply
+            assert "/thread next for more." in reply
+            assert "/thread prev" not in reply
+
+            # /thread next advances the cursor and fetches the next offset.
+            reply = await manager._handle_thread_command(self._msg("/thread next"), "next")
+            assert "1. t11" in reply
+            assert "/thread prev" in reply  # page > 1 footer includes prev
+            assert manager._thread_picker_page[key] == 2
+            assert requested_pages[-1] == 2  # the next offset was fetched
+
+            # /thread prev returns to page 1.
+            reply = await manager._handle_thread_command(self._msg("/thread prev"), "prev")
+            assert "1. t1" in reply
+            assert manager._thread_picker_page[key] == 1
+
+            # /thread prev on page 1 clamps at 1 (no crash, stays on page 1).
+            reply = await manager._handle_thread_command(self._msg("/thread prev"), "prev")
+            assert "1. t1" in reply
+            assert manager._thread_picker_page[key] == 1
+
+            # /thread next on the last page reports no more without advancing.
+            await manager._handle_thread_command(self._msg("/thread next"), "next")  # -> page 2
+            reply = await manager._handle_thread_command(self._msg("/thread next"), "next")  # page 2 is last
+            assert reply == "No more threads."
+            assert manager._thread_picker_page[key] == 2
+
+        _run(go())
+
+    def test_thread_select_uses_current_page_cursor(self, monkeypatch):
+        """Selecting a number resolves against the *current* page (the in-memory
+        cursor), not always page 1, so paging then selecting stays consistent."""
+
+        async def go():
+            manager = self._make_manager(monkeypatch)
+            page_rows = {1: [self._row(f"t{i}") for i in range(1, 11)], 2: [self._row(f"t{i}") for i in range(11, 16)]}
+            self._install_fake_fetch(monkeypatch, manager, page_rows)
+            key = ("test", "chat1", None)
+
+            # Advance to page 2, then select row 1 -> resolves t11 (page 2), not t1.
+            await manager._handle_thread_command(self._msg("/thread next"), "next")
+            assert manager._thread_picker_page[key] == 2
+            reply = await manager._handle_thread_command(self._msg("/thread 1"), "1")
+            assert reply == "Now chatting in: t11."
+            assert manager.store.get_thread_id("test", "chat1") == "t11"
+            # The cursor resets to page 1 after a successful switch.
+            assert manager._thread_picker_page[key] == 1
+
+        _run(go())
+
+    def test_thread_is_isolated_per_channel(self, monkeypatch):
+        """Switching via /thread writes to the *channel-scoped* store key, so
+        re-pointing one channel never clobbers a sibling channel's mapping for
+        the same chat_id (the cross-channel safety property)."""
+
+        async def go():
+            manager = self._make_manager(monkeypatch)
+            store = manager.store
+            # Two rows; we switch the slack channel to the 2nd row.
+            self._install_fake_fetch(monkeypatch, manager, {1: [self._row("t1", "First"), self._row("t2", "Second")]})
+            # Pre-seed a telegram mapping for the same chat so we can prove it stays untouched.
+            store.set_thread_id("telegram", "chat1", "tg-thread")
+
+            reply = await manager._handle_thread_command(
+                InboundMessage(channel_name="slack", chat_id="chat1", user_id="user1", text="/thread 2", msg_type=InboundMessageType.COMMAND),
+                "2",
+            )
+            assert reply == "Now chatting in: Second (t2)."
+            # Slack's mapping now points at the selected thread...
+            assert store.get_thread_id("slack", "chat1") == "t2"
+            # ...and the telegram mapping is untouched for the same chat_id.
+            assert store.get_thread_id("telegram", "chat1") == "tg-thread"
+
+        _run(go())
+
+    def test_thread_invalid_selection(self, monkeypatch):
+        async def go():
+            manager = self._make_manager(monkeypatch)
+            store = manager.store
+            store.set_thread_id("test", "chat1", "before")
+            self._install_fake_fetch(monkeypatch, manager, {1: [self._row("t1", "One"), self._row("t2", "Two")]})
+
+            for text, arg in (("/thread abc", "abc"), ("/thread 0", "0"), ("/thread 11", "11"), ("/thread 3", "3")):
+                reply = await manager._handle_thread_command(self._msg(text), arg)
+                assert reply.startswith("Usage:"), f"{text} -> {reply!r}"
+                assert store.get_thread_id("test", "chat1") == "before", f"{text} changed the mapping"
+
+        _run(go())
+
+    def test_thread_no_threads(self, monkeypatch):
+        async def go():
+            manager = self._make_manager(monkeypatch)
+            self._install_fake_fetch(monkeypatch, manager, {})
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            manager.bus.subscribe_outbound(capture_outbound)
+            await manager.start()
+            await manager.bus.publish_inbound(self._msg("/thread"))
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            assert outbound_received[0].text == "You have no conversations yet. Send a message to start one."
+
+        _run(go())
+
+    def test_help_mentions_thread(self, monkeypatch):
+        async def go():
+            manager = self._make_manager(monkeypatch)
+            self._install_fake_fetch(monkeypatch, manager, {})
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            manager.bus.subscribe_outbound(capture_outbound)
+            await manager.start()
+            await manager.bus.publish_inbound(self._msg("/help"))
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            assert "/thread" in outbound_received[0].text
+
+        _run(go())
+
+    def test_fetch_thread_page_posts_search_with_owner_and_csrf(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+        from app.gateway.csrf_middleware import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+        from app.gateway.internal_auth import INTERNAL_OWNER_USER_ID_HEADER_NAME
+
+        calls: list[dict] = []
+
+        class MockResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                # 11 rows -> overflow of the 10-row page -> has_more True.
+                return [{"thread_id": f"t{i}", "values": {}} for i in range(11)]
+
+        class MockAsyncClient:
+            def __init__(self, *args, **kwargs):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def post(self, url, **kwargs):
+                calls.append({"url": url, **kwargs})
+                return MockResponse()
+
+        monkeypatch.setattr("app.channels.manager.httpx.AsyncClient", MockAsyncClient)
+
+        async def go():
+            manager = ChannelManager(bus=MessageBus(), store=ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json"), gateway_url="http://gateway:8001")
+            msg = InboundMessage(channel_name="test", chat_id="chat1", user_id="user1", owner_user_id="owner-1", text="/thread", msg_type=InboundMessageType.COMMAND)
+
+            rows, has_more = await manager._fetch_thread_page(msg, page=2)
+
+            # +1 overflow maps to has_more; rows truncated to the page size.
+            assert has_more is True
+            assert len(rows) == 10
+            assert rows[0]["thread_id"] == "t0"
+
+            call = calls[0]
+            assert call["url"] == "http://gateway:8001/api/threads/search"
+            assert call["json"] == {"limit": 11, "offset": 10, "archived": False}
+            headers = call["headers"]
+            assert headers[CSRF_HEADER_NAME] == manager._csrf_token
+            assert headers["Cookie"] == f"{CSRF_COOKIE_NAME}={manager._csrf_token}"
+            assert headers[INTERNAL_OWNER_USER_ID_HEADER_NAME] == "owner-1"
+
+        _run(go())
+
+    def test_fetch_thread_page_returns_none_on_error(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+
+        class MockAsyncClient:
+            def __init__(self, *args, **kwargs):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def post(self, url, **kwargs):
+                raise RuntimeError("gateway down")
+
+        monkeypatch.setattr("app.channels.manager.httpx.AsyncClient", MockAsyncClient)
+
+        async def go():
+            manager = ChannelManager(bus=MessageBus(), store=ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json"), gateway_url="http://gateway:8001")
+            msg = InboundMessage(channel_name="test", chat_id="chat1", user_id="user1", text="/thread", msg_type=InboundMessageType.COMMAND)
+            assert await manager._fetch_thread_page(msg, page=1) is None
 
         _run(go())
 

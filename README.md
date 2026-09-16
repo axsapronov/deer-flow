@@ -757,6 +757,9 @@ Once a channel is connected, you can interact with DeerFlow directly from the ch
 |---------|-------------|
 | `/new` | Start a new conversation |
 | `/status` | Show current thread info |
+| `/thread` | List your recent conversations |
+| `/thread <number>` | Switch to a listed conversation |
+| `/thread next \| prev` | Page through the list |
 | `/models` | List available models |
 | `/memory` | View memory |
 | `/agent list` | List your Custom Agents |

@@ -65,6 +65,10 @@ CHANNEL_AGENT_METADATA_KEY = "channel_agent_name"
 THREAD_AGENT_METADATA_KEY = "agent_name"
 MAX_CHANNEL_AGENT_LIST_ITEMS = 50
 MAX_CHANNEL_AGENT_DESCRIPTION_CHARS = 120
+# Number of recent threads shown per page by the /thread picker. The fetch
+# requests one extra row (limit = PAGE_SIZE + 1) to detect whether a next page
+# exists without a second round-trip.
+THREAD_LIST_PAGE_SIZE = 10
 
 # Lead-agent recursion budget (LangGraph super-steps for the lead graph only).
 # This is independent of subagent depth: a `task()` dispatch runs the whole
@@ -1060,6 +1064,11 @@ class ChannelManager:
         # Per-conversation locks so concurrent inbound messages for the same
         # chat don't race to create duplicate threads (see _get_or_create_thread).
         self._thread_create_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
+        # Per-conversation page cursor for the /thread picker, keyed by the same
+        # (channel_name, chat_id, topic_id) tuple the store uses. In-memory only:
+        # it resets on Gateway restart (the list is deterministic, so the user
+        # simply re-lists). Bounded like the other caches below.
+        self._thread_picker_page: dict[tuple[str, str, str | None], int] = {}
         # Per-thread run locks for channels that want in-manager serialization
         # instead of surfacing the runtime's generic busy reply.
         self._serialized_thread_runs: dict[tuple[str, str], _SerializedThreadRunState] = {}
@@ -2591,6 +2600,8 @@ class ChannelManager:
             reply = await self._handle_goal_command(msg, parts[1] if len(parts) > 1 else "")
             if reply is None:
                 return
+        elif reply is None and command == "thread":
+            reply = await self._handle_thread_command(msg, parts[1] if len(parts) > 1 else "")
         elif reply is None and command == "help":
             reply = (
                 "Available commands:\n"
@@ -2598,6 +2609,9 @@ class ChannelManager:
                 "/goal [condition|clear] — Set, show, or clear an active goal\n"
                 "/new — Start a new conversation\n"
                 "/status — Show current thread info\n"
+                "/thread — List your recent conversations\n"
+                "/thread <number> — Switch to a listed conversation\n"
+                "/thread next | prev — Page through the list\n"
                 "/models — List available models\n"
                 "/memory — Show memory status\n"
                 "/agent list — List your Custom Agents\n"
@@ -2743,6 +2757,145 @@ class ChannelManager:
         chat_msg = _dc_replace(msg, text=command.objective, msg_type=InboundMessageType.CHAT)
         await self._handle_chat(chat_msg, bound_identity_checked=True)
         return None
+
+    def _get_thread_picker_page(self, key: tuple[str, str, str | None]) -> int:
+        return self._thread_picker_page.get(key, 1)
+
+    def _set_thread_picker_page(self, key: tuple[str, str, str | None], page: int) -> None:
+        if len(self._thread_picker_page) > 4096:
+            self._thread_picker_page.clear()
+        self._thread_picker_page[key] = page
+
+    async def _fetch_thread_page(self, msg: InboundMessage, *, page: int) -> tuple[list[dict], bool] | None:
+        """Fetch one page of the owner's recent threads from the Gateway.
+
+        Posts to ``/api/threads/search`` — the same owner-scoped, pinned-first
+        endpoint the Web UI uses — with ``limit = THREAD_LIST_PAGE_SIZE + 1`` so
+        the extra row reveals whether a next page exists without a second
+        round-trip. Returns ``(rows, has_more)`` on success, where ``rows`` holds
+        at most ``THREAD_LIST_PAGE_SIZE`` entries, or ``None`` on any HTTP/parse
+        error so the caller can distinguish a real failure from a legitimately
+        empty list. The CSRF double-submit mirrors ``_get_client()`` so the POST
+        passes in both auth-disabled and auth-enabled modes.
+        """
+        offset = (page - 1) * THREAD_LIST_PAGE_SIZE
+        limit = THREAD_LIST_PAGE_SIZE + 1
+        headers = {
+            **(_owner_headers(msg) or create_internal_auth_headers()),
+            CSRF_HEADER_NAME: self._csrf_token,
+            "Cookie": f"{CSRF_COOKIE_NAME}={self._csrf_token}",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{self._gateway_url}/api/threads/search",
+                    json={"limit": limit, "offset": offset, "archived": False},
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception:
+            logger.exception("[Manager] failed to list threads for /thread command")
+            return None
+        if not isinstance(data, list):
+            return None
+        return data[:THREAD_LIST_PAGE_SIZE], len(data) > THREAD_LIST_PAGE_SIZE
+
+    def _render_thread_list(self, rows: list[dict], current_thread_id: str | None, *, page: int) -> str:
+        """Render one numbered page of threads for the /thread picker."""
+        if not rows:
+            return "You have no conversations yet. Send a message to start one."
+        lines: list[str] = []
+        for idx, row in enumerate(rows, start=1):
+            thread_id = row.get("thread_id", "") if isinstance(row, dict) else ""
+            values = row.get("values") if isinstance(row, dict) else None
+            title = values.get("title") if isinstance(values, dict) else None
+            short_id = thread_id[:8] if thread_id else ""
+            display = title if title else short_id
+            suffix = " (current)" if current_thread_id and thread_id == current_thread_id else ""
+            lines.append(f"{idx}. {display}{suffix}")
+        footer_parts = ["Reply /thread <number> to switch."]
+        if page > 1:
+            footer_parts.append("/thread prev")
+        footer_parts.append("/thread next for more.")
+        return "\n".join(lines) + "\n" + " ".join(footer_parts)
+
+    async def _handle_thread_command(self, msg: InboundMessage, arg: str) -> str:
+        """Handle /thread: list recent threads, page, and switch the conversation.
+
+        Grammar:
+          /thread          -> show page 1
+          /thread <n>      -> switch to the n-th thread on the current page
+          /thread next     -> next page (or "No more threads.")
+          /thread prev     -> previous page (clamped at 1)
+          /thread <other>  -> usage hint
+        """
+        key = (msg.channel_name, msg.chat_id, msg.topic_id)
+        arg = arg.strip()
+        current_thread_id = await self._lookup_thread_id(msg)
+        usage = "Usage: /thread | /thread <number> | /thread next | /thread prev"
+
+        if not arg:
+            self._set_thread_picker_page(key, 1)
+            result = await self._fetch_thread_page(msg, page=1)
+            if result is None:
+                return "Failed to list threads. Please try again."
+            rows, _ = result
+            return self._render_thread_list(rows, current_thread_id, page=1)
+
+        if arg.lower() == "next":
+            page = self._get_thread_picker_page(key)
+            current = await self._fetch_thread_page(msg, page=page)
+            if current is None:
+                return "Failed to list threads. Please try again."
+            _, has_more = current
+            if not has_more:
+                return "No more threads."
+            next_page = page + 1
+            self._set_thread_picker_page(key, next_page)
+            result = await self._fetch_thread_page(msg, page=next_page)
+            if result is None:
+                return "Failed to list threads. Please try again."
+            rows, _ = result
+            return self._render_thread_list(rows, current_thread_id, page=next_page)
+
+        if arg.lower() == "prev":
+            target = max(1, self._get_thread_picker_page(key) - 1)
+            self._set_thread_picker_page(key, target)
+            result = await self._fetch_thread_page(msg, page=target)
+            if result is None:
+                return "Failed to list threads. Please try again."
+            rows, _ = result
+            return self._render_thread_list(rows, current_thread_id, page=target)
+
+        if not arg.isdigit():
+            return usage
+
+        index = int(arg)
+        if index < 1 or index > THREAD_LIST_PAGE_SIZE:
+            return usage
+        page = self._get_thread_picker_page(key)
+        result = await self._fetch_thread_page(msg, page=page)
+        if result is None:
+            return "Failed to list threads. Please try again."
+        rows, _ = result
+        if index > len(rows):
+            return usage
+
+        selected = rows[index - 1]
+        thread_id = selected.get("thread_id") if isinstance(selected, dict) else None
+        if not isinstance(thread_id, str) or not thread_id:
+            return usage
+        values = selected.get("values") if isinstance(selected, dict) else None
+        title = values.get("title") if isinstance(values, dict) else None
+
+        await self._store_thread_id(msg, thread_id)
+        self._set_thread_picker_page(key, 1)  # reset the cursor after a switch
+
+        short_id = thread_id[:8]
+        if title:
+            return f"Now chatting in: {title} ({short_id})."
+        return f"Now chatting in: {short_id}."
 
     async def _fetch_gateway(self, path: str, kind: str, *, msg: InboundMessage | None = None) -> str:
         """Fetch data from the Gateway API for command responses."""

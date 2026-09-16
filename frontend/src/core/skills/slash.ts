@@ -18,6 +18,7 @@ export const RESERVED_SLASH_SKILL_NAMES = new Set([
   "models",
   "new",
   "status",
+  "thread",
 ]);
 
 export const SLASH_SKILL_RE = /^\/([a-z0-9]+(?:-[a-z0-9]+)*)(?:\s+|$)/;
